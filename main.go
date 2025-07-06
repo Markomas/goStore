@@ -67,6 +67,8 @@ func main() {
 		
 		CREATE UNIQUE INDEX IF NOT EXISTS key_index
 			on records (key, topic);
+        create index IF NOT EXISTS records_topic_index
+			on records (topic);
 		create index IF NOT EXISTS records_content_index
 			on records (content);
 
