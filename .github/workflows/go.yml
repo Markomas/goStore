@@ -3,6 +3,8 @@ name: Build Go Binary
 on:
   push:
     branches: [ master ]
+    tags:
+      - 'v*'  # match tags like v1.0.0, v2.3.1 etc.
   pull_request:
     branches: [ master ]
 
