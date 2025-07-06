@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"io"
@@ -27,10 +28,19 @@ type Record struct {
 
 var db *sql.DB
 var logfile *os.File
+var logfilePath string
 
 func main() {
+	// Command-line flags
+	dbPath := flag.String("db", "./data.db", "Path to SQLite database file")
+	logPath := flag.String("logfile", "store.log", "Path to log file")
+	importLog := flag.Bool("import-log", false, "Import and decompress log file on startup")
+	flag.Parse()
+
+	logfilePath = *logPath
+
 	var err error
-	db, err = sql.Open("sqlite3", "./data.db")
+	db, err = sql.Open("sqlite3", *dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -46,18 +56,26 @@ func main() {
 		, updated_at integer, created_at integer not null);
 		CREATE UNIQUE INDEX IF NOT EXISTS key_index
 			on records (key);
-`)
+	`)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	readAndDecompressLogFile("store.log")
+	if *importLog {
+		fmt.Printf("Importing from log file: %s\n", *logPath)
+		if err := readAndDecompressLogFile(*logPath); err != nil {
+			log.Printf("Error importing log file: %v\n", err)
+		}
+	}
 
-	logfile, err = os.OpenFile("store.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	logfile, err = os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer logfile.Close()
 
 	http.HandleFunc("/add", addHandler)
-	http.HandleFunc("/get-by-key", getHandler) // expects /get/{id}
+	http.HandleFunc("/get-by-key", getHandler)
 	http.HandleFunc("/search", searchHandler)
 
 	fmt.Println("Listening on :8080")
@@ -69,14 +87,11 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Read the body into a byte slice
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Cannot read body", http.StatusBadRequest)
 		return
 	}
-	// Restore the io.ReadCloser to allow further reading
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
 	var rec Record
@@ -86,7 +101,6 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = saveJsonToDB(rec)
-
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -199,7 +213,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 }
 
 func readAndDecompressLogFile(filename string) error {
@@ -212,17 +225,14 @@ func readAndDecompressLogFile(filename string) error {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		b64line := scanner.Text()
-		// Skip empty lines (optional)
 		if len(b64line) == 0 {
 			continue
 		}
-		// Base64 decode
 		gzData, err := base64.StdEncoding.DecodeString(b64line)
 		if err != nil {
 			fmt.Println("Base64 decode error:", err)
 			continue
 		}
-		// Gzip decompress
 		zr, err := gzip.NewReader(bytes.NewReader(gzData))
 		if err != nil {
 			fmt.Println("Gzip decompress error:", err)
