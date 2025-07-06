@@ -67,10 +67,31 @@ func main() {
 		
 		CREATE UNIQUE INDEX IF NOT EXISTS key_index
 			on records (key, topic);
-        create index IF NOT EXISTS records_topic_index
-			on records (topic);
-		create index IF NOT EXISTS records_content_index
-			on records (content);
+       CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+			    key,
+				topic,
+				content,
+				content='records',
+				content_rowid='id',
+				prefix='2 3 4'
+		);
+		-- Insert trigger
+		CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+		  INSERT INTO records_fts(rowid, key, topic, content)
+		  VALUES (new.id, new.key, new.topic, new.content);
+		END;
+		
+		-- Delete trigger
+		CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+		  DELETE FROM records_fts WHERE rowid = old.id;
+		END;
+		
+		-- Update trigger
+		CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
+		  UPDATE records_fts SET key = new.key, topic = new.topic, content = new.content
+		  WHERE rowid = old.id;
+		END;
+
 
 	`)
 	if err != nil {
@@ -217,9 +238,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	query := `SELECT key, content, updated_at, created_at FROM records
-              WHERE content LIKE ?  and topic=? LIMIT ? OFFSET ?`
-	rows, err := db.Query(query, topic, "%"+q+"%", limit, offset)
+	query := `SELECT r.key, r.topic, r.content, r.updated_at, r.created_at
+FROM records r
+JOIN records_fts fts ON r.id = fts.rowid
+WHERE fts.content MATCH ? and r.topic=? LIMIT? OFFSET?`
+	rows, err := db.Query(query, q+"*", topic, limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
