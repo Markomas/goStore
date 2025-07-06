@@ -36,6 +36,7 @@ func main() {
 	logPath := flag.String("logfile", "store.log", "Path to log file")
 	importLog := flag.Bool("import-log", false, "Import and decompress log file on startup")
 	apikeyFlag := flag.String("apikey", "demo", "API key required for all requests")
+	flag.Parse()
 	apiKey = *apikeyFlag
 	if apiKey == "" {
 		log.Fatal("API key must be provided using -apikey")
