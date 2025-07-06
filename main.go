@@ -21,6 +21,7 @@ import (
 
 type Record struct {
 	Key       string `json:"key"`
+	Topic     string `json:"topic"`
 	Content   string `json:"content"`
 	UpdatedAt int64  `json:"updated_at"`
 	CreatedAt int64  `json:"created_at"`
@@ -56,12 +57,19 @@ func main() {
         CREATE TABLE IF NOT EXISTS "records"
 		(
 			id      INTEGER
-				primary key autoincrement,
+			primary key autoincrement,
 			key     TEXT,
-			content TEXT
-		, updated_at integer, created_at integer not null);
+			topic     TEXT,
+			content TEXT,
+			updated_at integer,
+			created_at integer not null
+		);
+		
 		CREATE UNIQUE INDEX IF NOT EXISTS key_index
-			on records (key);
+			on records (key, topic);
+		create index IF NOT EXISTS records_content_index
+			on records (content);
+
 	`)
 	if err != nil {
 		log.Fatal(err)
@@ -100,6 +108,7 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
+	log.Println("Received add request:", string(body))
 	var rec Record
 	if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -124,9 +133,9 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 
 func saveJsonToDB(rec Record) error {
 	_, err := db.Exec(`
-        INSERT INTO records (key, content, created_at, updated_at) VALUES (?, ?,?,?)
-        ON CONFLICT(key) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at;
-    `, rec.Key, rec.Content, time.Now().Unix(), time.Now().Unix())
+        INSERT INTO records (key, topic, content, created_at, updated_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(key, topic) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at;
+    `, rec.Key, rec.Topic, rec.Content, time.Now().Unix(), time.Now().Unix())
 	return err
 }
 
@@ -154,7 +163,7 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rec Record
-	err := db.QueryRow("SELECT key, content, updated_at, created_at FROM records WHERE key=?", key).Scan(&rec.Key, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt)
+	err := db.QueryRow("SELECT key, topic, content, updated_at, created_at FROM records WHERE key=?", key).Scan(&rec.Key, &rec.Topic, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -207,7 +216,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	results := []Record{}
 	for rows.Next() {
 		var rec Record
-		if err := rows.Scan(&rec.Key, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt); err != nil {
+		if err := rows.Scan(&rec.Key, &rec.Topic, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
