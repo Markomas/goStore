@@ -27,3 +27,10 @@ jobs:
         with:
           name: goStore
           path: goStore
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: goStore
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
