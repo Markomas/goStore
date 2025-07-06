@@ -40,6 +40,7 @@ func main() {
 	if apiKey == "" {
 		log.Fatal("API key must be provided using -apikey")
 	}
+	log.Println("API key: %s\n", apiKey)
 
 	flag.Parse()
 
