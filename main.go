@@ -4,19 +4,28 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/blevesearch/bleve/v2"
+	"github.com/dgraph-io/badger/v4"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
+)
+
+var (
+	index   bleve.Index
+	apiKey  string
+	logfile *os.File
+	db      *badger.DB
 )
 
 type Record struct {
@@ -27,76 +36,64 @@ type Record struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
-var db *sql.DB
-var logfile *os.File
-var apiKey string
-
 func main() {
-	// Command-line flags
-	dbPath := flag.String("db", "./data.db", "Path to SQLite database file")
+	storagePathFlag := flag.String("storage", "storage", "Storage folder for index, db and log")
+	indexPathFlag := flag.String("indexpath", "index.bleve", "Path to Bleve index directory")
+	badgerFolder := flag.String("dbpath", "badger", "DB folder path")
 	logPath := flag.String("logfile", "store.log", "Path to log file")
 	importLog := flag.Bool("import-log", false, "Import and decompress log file on startup")
 	apikeyFlag := flag.String("apikey", "demo", "API key required for all requests")
 	flag.Parse()
+
+	if *storagePathFlag != "" {
+		err := os.MkdirAll(*storagePathFlag, 0755)
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
+		*indexPathFlag = filepath.Join(*storagePathFlag, "bleve.index")
+		*badgerFolder = filepath.Join(*storagePathFlag, "badger.db")
+		*logPath = filepath.Join(*storagePathFlag, "store.log")
+	}
+
 	apiKey = *apikeyFlag
 	if apiKey == "" {
 		log.Fatal("API key must be provided using -apikey")
 	}
 	log.Printf("API key: %s\n", apiKey)
 
-	flag.Parse()
-
 	var err error
-	db, err = sql.Open("sqlite3", *dbPath)
+	logfile, err = os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer logfile.Close()
 
-	// Initialize table if not exists
-	_, err = db.Exec(`
-        CREATE TABLE IF NOT EXISTS "records"
-		(
-			id      INTEGER
-			primary key autoincrement,
-			key     TEXT,
-			topic     TEXT,
-			content TEXT,
-			updated_at integer,
-			created_at integer not null
-		);
-		
-		CREATE UNIQUE INDEX IF NOT EXISTS key_index
-			on records (key, topic);
-       CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-			    key,
-				topic,
-				content,
-				content='records',
-				content_rowid='id',
-				prefix='2 3 4'
-		);
-		-- Insert trigger
-		CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
-		  INSERT INTO records_fts(rowid, key, topic, content)
-		  VALUES (new.id, new.key, new.topic, new.content);
-		END;
-		
-		-- Delete trigger
-		CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
-		  DELETE FROM records_fts WHERE rowid = old.id;
-		END;
-		
-		-- Update trigger
-		CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
-		  UPDATE records_fts SET key = new.key, topic = new.topic, content = new.content
-		  WHERE rowid = old.id;
-		END;
+	// Open or create Bleve index
+	index, err = bleve.Open(*indexPathFlag)
+	if errors.Is(err, bleve.ErrorIndexPathDoesNotExist) {
+		mapping := bleve.NewIndexMapping()
 
+		docMapping := bleve.NewDocumentMapping()
 
-	`)
+		textFieldMapping := bleve.NewTextFieldMapping()
+		docMapping.AddFieldMappingsAt("Topic", textFieldMapping)
+		docMapping.AddFieldMappingsAt("Content", textFieldMapping)
+
+		mapping.AddDocumentMapping("record", docMapping)
+
+		index, err = bleve.New(*indexPathFlag, mapping)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer index.Close()
+
+	db, err = badger.Open(badger.DefaultOptions(*badgerFolder))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
 
 	if *importLog {
 		fmt.Printf("Importing from log file: %s\n", *logPath)
@@ -105,165 +102,12 @@ func main() {
 		}
 	}
 
-	logfile, err = os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer logfile.Close()
-
 	http.HandleFunc("/add", withAPIKeyAuth(addHandler))
-	http.HandleFunc("/get-by-key", withAPIKeyAuth(getHandler))
+	http.HandleFunc("/get", withAPIKeyAuth(getHandler))
 	http.HandleFunc("/search", withAPIKeyAuth(searchHandler))
 
 	fmt.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func addHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Cannot read body", http.StatusBadRequest)
-		return
-	}
-	r.Body = io.NopCloser(bytes.NewBuffer(body))
-
-	log.Println("Received add request:", string(body))
-	var rec Record
-	if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	err = saveJsonToDB(rec)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	logToFile(body)
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func saveJsonToDB(rec Record) error {
-	_, err := db.Exec(`
-        INSERT INTO records (key, topic, content, created_at, updated_at) VALUES (?,?,?,?,?)
-        ON CONFLICT(key, topic) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at;
-    `, rec.Key, rec.Topic, rec.Content, time.Now().Unix(), time.Now().Unix())
-	return err
-}
-
-func logToFile(body []byte) {
-	go func(data []byte) {
-		var buf bytes.Buffer
-		zw := gzip.NewWriter(&buf)
-		_, err := zw.Write(data)
-		if err != nil {
-			log.Println("gzip error:", err)
-			return
-		}
-		zw.Close()
-
-		encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
-		logfile.WriteString(encoded + "\n")
-	}(body)
-}
-
-func getHandler(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		http.Error(w, "Missing key param", http.StatusBadRequest)
-		return
-	}
-
-	topic := r.URL.Query().Get("topic")
-	if topic == "" {
-		http.Error(w, "Missing topic param", http.StatusBadRequest)
-		return
-	}
-
-	var rec Record
-	err := db.QueryRow("SELECT key, topic, content, updated_at, created_at FROM records WHERE key=? and topic=?", key, topic).Scan(&rec.Key, &rec.Topic, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "Not found", http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(rec)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func searchHandler(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("q")
-	if q == "" {
-		http.Error(w, "Missing 'q' param", http.StatusBadRequest)
-		return
-	}
-	topic := r.URL.Query().Get("topic")
-	if topic == "" {
-		http.Error(w, "Missing topic param", http.StatusBadRequest)
-		return
-	}
-
-	// Get pagination params
-	limitStr := r.URL.Query().Get("limit")
-	offsetStr := r.URL.Query().Get("offset")
-
-	limit := 20 // default
-	offset := 0 // default
-
-	if limitStr != "" {
-		if val, err := strconv.Atoi(limitStr); err == nil && val > 0 && val <= 100 {
-			limit = val
-		}
-	}
-	if offsetStr != "" {
-		if val, err := strconv.Atoi(offsetStr); err == nil && val >= 0 {
-			offset = val
-		}
-	}
-
-	query := `SELECT r.key, r.topic, r.content, r.updated_at, r.created_at
-FROM records r
-JOIN records_fts fts ON r.id = fts.rowid
-WHERE fts.content MATCH ? and r.topic=? LIMIT? OFFSET?`
-	rows, err := db.Query(query, q+"*", topic, limit, offset)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	results := []Record{}
-	for rows.Next() {
-		var rec Record
-		if err := rows.Scan(&rec.Key, &rec.Topic, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		results = append(results, rec)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(results); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 }
 
 func readAndDecompressLogFile(filename string) error {
@@ -273,8 +117,32 @@ func readAndDecompressLogFile(filename string) error {
 	}
 	defer file.Close()
 
+	const workerCount = 8
+	dataChan := make(chan []byte, 100)
+	errChan := make(chan error, workerCount)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for data := range dataChan {
+				if err := saveToDB(data); err != nil {
+					fmt.Println("Save to DB error:", err)
+					errChan <- err
+				}
+			}
+		}()
+	}
+
 	scanner := bufio.NewScanner(file)
+	count := 0
 	for scanner.Scan() {
+		count++
+		if count%100 == 0 {
+			fmt.Printf("Processed %d records\n", count)
+		}
 		b64line := scanner.Text()
 		if len(b64line) == 0 {
 			continue
@@ -297,24 +165,63 @@ func readAndDecompressLogFile(filename string) error {
 			continue
 		}
 
-		var rec Record
-		err = json.Unmarshal(out.Bytes(), &rec)
-		if err != nil {
-			fmt.Println("Unmarshal JSON error:", err)
-			continue
-		}
-
-		err = saveJsonToDB(rec)
-		if err != nil {
-			fmt.Println("Save to DB error:", err)
-			continue
-		}
+		dataChan <- out.Bytes()
 	}
+
+	close(dataChan)
+	wg.Wait()
 
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+
+	close(errChan)
+	if len(errChan) > 0 {
+		return fmt.Errorf("some records failed to save")
+	}
+
 	return nil
+}
+
+func getHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "Missing key param", http.StatusBadRequest)
+		return
+	}
+
+	topic := r.URL.Query().Get("topic")
+	if topic == "" {
+		http.Error(w, "Missing topic param", http.StatusBadRequest)
+		return
+	}
+
+	keyParam := fmt.Sprintf("%s:%s", key, topic)
+
+	var rec Record
+
+	err := db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(keyParam))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			return json.Unmarshal(val, &rec)
+		})
+	})
+
+	if err == badger.ErrKeyNotFound {
+		http.Error(w, "Record not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Internal error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(rec); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
 }
 
 func withAPIKeyAuth(handler http.HandlerFunc) http.HandlerFunc {
@@ -326,4 +233,151 @@ func withAPIKeyAuth(handler http.HandlerFunc) http.HandlerFunc {
 		}
 		handler(w, r)
 	}
+}
+
+func addHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Cannot read body", http.StatusBadRequest)
+		return
+	}
+
+	logToFile(body)
+	err = saveToDB(body)
+	if err != nil {
+		http.Error(w, "Internal error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func saveToDB(body []byte) error {
+	var rec Record
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&rec); err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s:%s", rec.Key, rec.Topic)
+
+	now := time.Now().Unix()
+	existing := false
+	var oldRecord Record
+
+	// Check if record exists
+	err := db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(key))
+		if err == badger.ErrKeyNotFound {
+			return nil // Not an error — just no existing record
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			return json.Unmarshal(val, &oldRecord)
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	if oldRecord.Key != "" {
+		existing = true
+	}
+
+	if existing {
+		rec.CreatedAt = oldRecord.CreatedAt
+	} else {
+		rec.CreatedAt = now
+	}
+	rec.UpdatedAt = now
+
+	// Save to DB
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+
+	err = db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(key), data)
+	})
+	if err != nil {
+		return err
+	}
+
+	// Index to Bleve
+	err = index.Index(key, map[string]interface{}{
+		"Key":     rec.Key,
+		"Topic":   rec.Topic,
+		"Content": rec.Content,
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func logToFile(body []byte) {
+	go func(data []byte) {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, err := zw.Write(data)
+		if err != nil {
+			log.Println("gzip error:", err)
+			return
+		}
+		zw.Close()
+
+		encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
+		logfile.WriteString(encoded + "\n")
+	}(body)
+}
+
+func searchHandler(w http.ResponseWriter, r *http.Request) {
+	topic := r.URL.Query().Get("topic")
+	queryText := r.URL.Query().Get("q")
+
+	topicQuery := bleve.NewMatchQuery(topic)
+	topicQuery.SetField("Topic")
+
+	contentQuery := bleve.NewMatchQuery(queryText)
+	contentQuery.SetField("Content")
+	contentQuery.SetFuzziness(2)
+
+	query := bleve.NewConjunctionQuery(topicQuery, contentQuery)
+
+	searchReq := bleve.NewSearchRequest(query)
+	searchReq.Size = 10
+
+	searchRes, err := index.Search(searchReq)
+	if err != nil {
+		http.Error(w, "Search failed", http.StatusInternalServerError)
+		return
+	}
+
+	results := []Record{}
+	for _, hit := range searchRes.Hits {
+		err := db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte(hit.ID))
+			if err != nil {
+				return nil
+			}
+			return item.Value(func(val []byte) error {
+				var rec Record
+				if err := json.Unmarshal(val, &rec); err == nil && strings.EqualFold(rec.Topic, topic) {
+					results = append(results, rec)
+				}
+				return nil
+			})
+		})
+		if err != nil {
+			continue
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
 }
