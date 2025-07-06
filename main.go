@@ -162,8 +162,14 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	topic := r.URL.Query().Get("topic")
+	if topic == "" {
+		http.Error(w, "Missing topic param", http.StatusBadRequest)
+		return
+	}
+
 	var rec Record
-	err := db.QueryRow("SELECT key, topic, content, updated_at, created_at FROM records WHERE key=?", key).Scan(&rec.Key, &rec.Topic, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt)
+	err := db.QueryRow("SELECT key, topic, content, updated_at, created_at FROM records WHERE key=? and topic=?", key, topic).Scan(&rec.Key, &rec.Topic, &rec.Content, &rec.UpdatedAt, &rec.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -183,6 +189,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	if q == "" {
 		http.Error(w, "Missing 'q' param", http.StatusBadRequest)
+		return
+	}
+	topic := r.URL.Query().Get("topic")
+	if topic == "" {
+		http.Error(w, "Missing topic param", http.StatusBadRequest)
 		return
 	}
 
@@ -205,8 +216,8 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `SELECT key, content, updated_at, created_at FROM records
-              WHERE content LIKE ? LIMIT ? OFFSET ?`
-	rows, err := db.Query(query, "%"+q+"%", limit, offset)
+              WHERE content LIKE ?  and topic=? LIMIT ? OFFSET ?`
+	rows, err := db.Query(query, topic, "%"+q+"%", limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
