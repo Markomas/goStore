@@ -28,16 +28,20 @@ type Record struct {
 
 var db *sql.DB
 var logfile *os.File
-var logfilePath string
+var apiKey string
 
 func main() {
 	// Command-line flags
 	dbPath := flag.String("db", "./data.db", "Path to SQLite database file")
 	logPath := flag.String("logfile", "store.log", "Path to log file")
 	importLog := flag.Bool("import-log", false, "Import and decompress log file on startup")
-	flag.Parse()
+	apikeyFlag := flag.String("apikey", "demo", "API key required for all requests")
+	apiKey = *apikeyFlag
+	if apiKey == "" {
+		log.Fatal("API key must be provided using -apikey")
+	}
 
-	logfilePath = *logPath
+	flag.Parse()
 
 	var err error
 	db, err = sql.Open("sqlite3", *dbPath)
@@ -74,9 +78,9 @@ func main() {
 	}
 	defer logfile.Close()
 
-	http.HandleFunc("/add", addHandler)
-	http.HandleFunc("/get-by-key", getHandler)
-	http.HandleFunc("/search", searchHandler)
+	http.HandleFunc("/add", withAPIKeyAuth(addHandler))
+	http.HandleFunc("/get-by-key", withAPIKeyAuth(getHandler))
+	http.HandleFunc("/search", withAPIKeyAuth(searchHandler))
 
 	fmt.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -264,4 +268,15 @@ func readAndDecompressLogFile(filename string) error {
 		return err
 	}
 	return nil
+}
+
+func withAPIKeyAuth(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		if key != apiKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		handler(w, r)
+	}
 }
