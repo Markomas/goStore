@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"store/internal"
 	"store/pkg/database"
 )
 
 type Handler struct {
-	DB *database.Database
+	DB  *database.Database
+	Cfg *internal.Config
 }

@@ -14,10 +14,10 @@ func Run(cfg internal.Config) {
 	db := database.NewUserDatabase(cfg.Database.Path)
 	defer db.Close()
 
-	h := &handler.Handler{DB: db}
+	h := &handler.Handler{DB: db, Cfg: &cfg}
 
-	http.HandleFunc("/add/", h.Add)
-	http.HandleFunc("/add", h.AddDefault)
+	http.Handle("/add/", h.ApiKeyCheck(http.HandlerFunc(h.Add)))
+	http.Handle("/add", h.ApiKeyCheck(http.HandlerFunc(h.AddDefault)))
 
 	fmt.Println("Server running at :" + cfg.Server.Port)
 	log.Fatal(http.ListenAndServe(":"+cfg.Server.Port, nil))
