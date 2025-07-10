@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"os"
@@ -10,7 +11,9 @@ import (
 
 func main() {
 
-	f, err := os.Open("config/config.yml")
+	configPath := flag.String("config", "config/config.yml", "path to config file (yaml or toml)")
+	flag.Parse()
+	f, err := os.Open(*configPath)
 	if err != nil {
 		processError(err)
 	}
